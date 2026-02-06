@@ -1,0 +1,364 @@
+---
+# ============================================================================
+# Namespace
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rtb-system
+
+---
+# ============================================================================
+# ConfigMap
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rtb-config
+  namespace: rtb-system
+data:
+  WORKERS: "4"
+  PORT: "8000"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  LOG_LEVEL: "info"
+
+---
+# ============================================================================
+# Secret
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rtb-secrets
+  namespace: rtb-system
+type: Opaque
+stringData:
+  POSTGRES_USER: "rtbuser"
+  POSTGRES_PASSWORD: "rtbpass"
+  API_KEY: "prod_key_67890"
+
+---
+# ============================================================================
+# RTB API Deployment
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rtb-api
+  namespace: rtb-system
+  labels:
+    app: rtb-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rtb-api
+  template:
+    metadata:
+      labels:
+        app: rtb-api
+    spec:
+      containers:
+      - name: rtb-api
+        image: rtb-system:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: WORKERS
+          valueFrom:
+            configMapKeyRef:
+              name: rtb-config
+              key: WORKERS
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rtb-config
+              key: PORT
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rtb-config
+              key: REDIS_HOST
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: rtb-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rtb-secrets
+              key: POSTGRES_PASSWORD
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: models
+          mountPath: /app/models
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: rtb-models-pvc
+      - name: logs
+        persistentVolumeClaim:
+          claimName: rtb-logs-pvc
+
+---
+# ============================================================================
+# RTB API Service
+# ============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: rtb-api-service
+  namespace: rtb-system
+  labels:
+    app: rtb-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: rtb-api
+
+---
+# ============================================================================
+# Redis Deployment
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: rtb-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        args:
+        - "--appendonly"
+        - "yes"
+        - "--maxmemory"
+        - "512mb"
+        - "--maxmemory-policy"
+        - "allkeys-lru"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-pvc
+
+---
+# ============================================================================
+# Redis Service
+# ============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: rtb-system
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: redis
+  selector:
+    app: redis
+
+---
+# ============================================================================
+# Horizontal Pod Autoscaler
+# ============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rtb-api-hpa
+  namespace: rtb-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rtb-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+      - type: Pods
+        value: 2
+        periodSeconds: 30
+      selectPolicy: Max
+
+---
+# ============================================================================
+# Ingress
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rtb-ingress
+  namespace: rtb-system
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - rtb-api.example.com
+    secretName: rtb-tls-secret
+  rules:
+  - host: rtb-api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rtb-api-service
+            port:
+              number: 8000
+
+---
+# ============================================================================
+# PersistentVolumeClaim - Models
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rtb-models-pvc
+  namespace: rtb-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# ============================================================================
+# PersistentVolumeClaim - Logs
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rtb-logs-pvc
+  namespace: rtb-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: standard
+
+---
+# ============================================================================
+# PersistentVolumeClaim - Redis
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-pvc
+  namespace: rtb-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+
+---
+# ============================================================================
+# ServiceMonitor for Prometheus
+# ============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rtb-api-metrics
+  namespace: rtb-system
+  labels:
+    app: rtb-api
+spec:
+  selector:
+    matchLabels:
+      app: rtb-api
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
